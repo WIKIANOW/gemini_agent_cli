@@ -137,15 +137,21 @@ class GeminiLocalAgent:
                         return res.text
                 except Exception as e:
                     err_msg = str(e)
-                    if any(code in err_msg for code in ["429", "503", "UNAVAILABLE", "RESOURCE_EXHAUSTED"]):
-                        err_type = "503 Bận" if "503" in err_msg else "429 Quota"
-                        print(f"\r\033[K⚠️️ Key ...{self.current_key[-6:]} ({err_type}) -> Đổi Key tiếp theo...", end="", flush=True)
+                    RETRYABLE_ERRORS = ["429", "503", "403", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "PERMISSION_DENIED"]
+                    if any(code in err_msg for code in RETRYABLE_ERRORS):
+                        if "503" in err_msg or "UNAVAILABLE" in err_msg:
+                            err_type = "503 Server Bận"
+                        elif "403" in err_msg or "PERMISSION_DENIED" in err_msg:
+                            err_type = "403 Key Bị Khóa/Cấm"
+                        else:
+                            err_type = "429 Quota/Rate Limit"
+                        print(f"\r\033[K⚠ Key ...{self.current_key[-6:]} ({err_type}) -> Đổi Key tiếp theo...", end="", flush=True)
                         self.rotate_key()
                     elif "not_found" in err_msg.lower() or "404" in err_msg:
                         break
                     else:
-                        print(f"\n❌ Lỗi ngoại lệ: {e}")
-                        return None
+                        print(f"\r\033[K⚠️ Key ...{self.current_key[-6:]} gặp lỗi ngoại lệ ({e}) -> Đổi Key tiếp theo...", end="", flush=True)
+                        self.rotate_key()
             print(f"\r\033[K🚨 Model {self.current_model_name} quá tải toàn bộ Key. Đang hạ cấp Model...", end="", flush=True)
             if not self.fallback_model():
                 print("\n❌ Cạn kiệt toàn bộ Model và Key khả dụng!")
@@ -157,15 +163,17 @@ class GeminiLocalAgent:
     # =====================================================================
     def detect_and_execute(self, user_input):
         pwd = os.getcwd()
-        self.chat_history.append({
-            "role": "user",
-            "parts": [{"text": user_input}]
-        })
+        self.chat_history.append(
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=user_input)]
+            )
+        )
         detect_prompt = (
             f"Current Working Directory: {pwd}\n"
             f"User Input: {user_input}\n"
             f"Detect if the user wants to create a new file, fix existing code, scan logs, or chat.\n"
-            f"Set action_type to 'create_file' if the user explicitly asks to create/write a new script or file (e.g. note/save to file)."
+            f"Set action_type to 'create_file' if the user explicitly asks to create/write/save/update a file."
         )
         print("\n🔄 [1/3] Đang phân tích câu lệnh và nhận diện ý định...")
         intent = self._execute_api_with_retry(detect_prompt, is_json=True, model_type='intent')
@@ -190,15 +198,18 @@ class GeminiLocalAgent:
             pass
         else:
             print("\n🤖 [AGENT RESPOND]:")
-            res = self._execute_api_with_retry(self.chat_history, is_json=False, model_type='chat')
-            if res:
-                print(res)
-                self.chat_history.append({
-                    "role": "model",
-                    "parts": [{"text": res}]
-                })
+            res_text = self._execute_api_with_retry(self.chat_history, is_json=False, model_type='chat')
+            if res_text and res_text.strip():
+                print(res_text)
+                self.chat_history.append(
+                    types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text=res_text)]
+                    )
+                )
             else:
-                self.chat_history.pop()
+                print("⚠️ Không nhận được nội dung văn bản từ Model.")
+                self.chat_history.pop() # Bỏ lượt hỏi vừa rồi nếu lỗi
 
     # =====================================================================
     # CÁC TÍNH NĂNG TẠO / SỬA / SOI CODE & LOG
@@ -209,8 +220,14 @@ class GeminiLocalAgent:
         if self.chat_history:
             recent_messages = []
             for msg in self.chat_history[-4:]:
-                role = msg.get("role", "")
-                text = msg.get("parts", [{}])[0].get("text", "")
+                if isinstance(msg, dict):
+                    role = msg.get("role", "")
+                    parts = msg.get("parts", [{}])
+                    text = parts[0].get("text", "") if isinstance(parts[0], dict) else getattr(parts[0], "text", "")
+                else:
+                    role = getattr(msg, "role", "")
+                    parts = getattr(msg, "parts", [])
+                    text = getattr(parts[0], "text", "") if parts else ""
                 recent_messages.append(f"[{role.upper()}]: {text}")
             recent_context = "\n\n--- RECENT CHAT HISTORY ---\n" + "\n".join(recent_messages)
         prompt = (
