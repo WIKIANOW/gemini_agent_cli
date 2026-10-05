@@ -6,9 +6,11 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
+
 load_dotenv()
+
 # =====================================================================
-# CẤU HÌNH SCHEMA JSON (Bổ sung full_file_code cho tạo file mới)
+# CẤU HÌNH SCHEMA JSON
 # =====================================================================
 class CodeFix(typing.TypedDict):
     file_path: str
@@ -25,7 +27,7 @@ class IssueDetail(typing.TypedDict):
 class AgentResponseSchema(typing.TypedDict):
     scope: str
     summary: str
-    full_file_code: str # Thêm trường này để tạo code mới hoàn toàn
+    full_file_code: str # Trường tạo code mới hoàn toàn
     fixes: list[CodeFix]
     issues: list[IssueDetail]
 
@@ -56,6 +58,7 @@ class GeminiLocalAgent:
         ]
         self.model_index = 0
         self.current_model_name = self.model_list[self.model_index]
+        self.chat_history = []
         self._configure()
 
     def _configure(self):
@@ -65,6 +68,10 @@ class GeminiLocalAgent:
             "When creating a new file or rewriting code, populate the 'full_file_code' field with complete, runnable code. "
             "Provide detailed 'summary' and 'explanation' for full process transparency."
         )
+
+    def clear_session(self):
+        self.chat_history = []
+        print("\r\033[K🧹 Đã xóa lịch sử chat của session hiện tại.")
 
     def rotate_key(self):
         self.current_key = next(self.key_cycle)
@@ -82,10 +89,11 @@ class GeminiLocalAgent:
             return True
         return False
 
-    def _execute_api_with_retry(self, prompt, is_json=True, model_type='code'):
-        token_count = len(prompt) // 4
+    def _execute_api_with_retry(self, prompt_or_contents, is_json=True, model_type='code'):
+        prompt_str = str(prompt_or_contents)
+        token_count = len(prompt_str) // 4
         if self.tokens_used_this_minute + token_count > self.tpm_limit:
-            print("\r\033[K⚠️️ Token/Phút sắp vượt ngưỡng. Đang đổi Key...", end="", flush=True)
+            print("\r\033[K⚠ Token/Phút sắp vượt ngưỡng. Đang đổi Key...", end="", flush=True)
             self.rotate_key()
         while True:
             for _ in range(len(self.api_keys)):
@@ -95,7 +103,7 @@ class GeminiLocalAgent:
                     if model_type == 'intent':
                         res = self.client.models.generate_content(
                             model=self.current_model_name,
-                            contents=prompt,
+                            contents=prompt_or_contents,
                             config=types.GenerateContentConfig(
                                 response_mime_type="application/json",
                                 response_schema=IntentSchema
@@ -106,7 +114,7 @@ class GeminiLocalAgent:
                     elif is_json:
                         res = self.client.models.generate_content(
                             model=self.current_model_name,
-                            contents=prompt,
+                            contents=prompt_or_contents,
                             config=types.GenerateContentConfig(
                                 system_instruction=self.system_instruction,
                                 response_mime_type="application/json",
@@ -119,7 +127,7 @@ class GeminiLocalAgent:
                     else:
                         res = self.client.models.generate_content(
                             model=self.current_model_name,
-                            contents=prompt,
+                            contents=prompt_or_contents,
                             config=types.GenerateContentConfig(
                                 system_instruction="You are a helpful software engineering assistant. Respond concisely in Markdown."
                             )
@@ -131,7 +139,7 @@ class GeminiLocalAgent:
                     err_msg = str(e)
                     if any(code in err_msg for code in ["429", "503", "UNAVAILABLE", "RESOURCE_EXHAUSTED"]):
                         err_type = "503 Bận" if "503" in err_msg else "429 Quota"
-                        print(f"\r\033[K⚠️ Key ...{self.current_key[-6:]} ({err_type}) -> Đổi Key tiếp theo...", end="", flush=True)
+                        print(f"\r\033[K⚠️️ Key ...{self.current_key[-6:]} ({err_type}) -> Đổi Key tiếp theo...", end="", flush=True)
                         self.rotate_key()
                     elif "not_found" in err_msg.lower() or "404" in err_msg:
                         break
@@ -149,11 +157,15 @@ class GeminiLocalAgent:
     # =====================================================================
     def detect_and_execute(self, user_input):
         pwd = os.getcwd()
+        self.chat_history.append({
+            "role": "user",
+            "parts": [{"text": user_input}]
+        })
         detect_prompt = (
             f"Current Working Directory: {pwd}\n"
             f"User Input: {user_input}\n"
             f"Detect if the user wants to create a new file, fix existing code, scan logs, or chat.\n"
-            f"Set action_type to 'create_file' if the user explicitly asks to create/write a new script or file."
+            f"Set action_type to 'create_file' if the user explicitly asks to create/write a new script or file (e.g. note/save to file)."
         )
         print("\n🔄 [1/3] Đang phân tích câu lệnh và nhận diện ý định...")
         intent = self._execute_api_with_retry(detect_prompt, is_json=True, model_type='intent')
@@ -175,32 +187,39 @@ class GeminiLocalAgent:
             elif os.path.isdir(abs_target):
                 self.analyze_workspace_and_fix(abs_target, custom_prompt)
         elif action == 'log_scan':
-            from_l = intent.get('from_line', -1)
-            to_l = intent.get('to_line', -1)
-            from_l = from_l if from_l > 0 else None
-            to_l = to_l if to_l > 0 else None
-            
-            if os.path.isfile(abs_target):
-                self.analyze_log_file(abs_target, custom_prompt, from_line=from_l, to_line=to_l)
-            else:
-                print(f"❌ File log `{abs_target}` không tồn tại.")
+            pass
         else:
             print("\n🤖 [AGENT RESPOND]:")
-            res = self._execute_api_with_retry(user_input, is_json=False)
+            res = self._execute_api_with_retry(self.chat_history, is_json=False, model_type='chat')
             if res:
                 print(res)
+                self.chat_history.append({
+                    "role": "model",
+                    "parts": [{"text": res}]
+                })
+            else:
+                self.chat_history.pop()
 
     # =====================================================================
     # CÁC TÍNH NĂNG TẠO / SỬA / SOI CODE & LOG
     # =====================================================================
     def _create_or_write_file(self, file_path, custom_prompt):
-        """Tạo file mới hoặc sinh nội dung script mới hoàn toàn"""
-        print(f"\n🧠 [2/3] Gemini đang khởi tạo mã nguồn mới cho file: {file_path}")
+        print(f"\n🧠 [2/3] Gemini đang khởi tạo mã nguồn/nội dung mới cho file: {file_path}")
+        recent_context = ""
+        if self.chat_history:
+            recent_messages = []
+            for msg in self.chat_history[-4:]:
+                role = msg.get("role", "")
+                text = msg.get("parts", [{}])[0].get("text", "")
+                recent_messages.append(f"[{role.upper()}]: {text}")
+            recent_context = "\n\n--- RECENT CHAT HISTORY ---\n" + "\n".join(recent_messages)
         prompt = (
             f"User Request: {custom_prompt}\n"
             f"Target File Path: {file_path}\n"
-            f"Write complete, working, production-ready code for this request.\n"
-            f"Return the entire code string in the 'full_file_code' JSON field."
+            f"{recent_context}\n\n"
+            f"Based on the request and the recent chat history above, write the complete content for this file.\n"
+            f"If the user asks to save/note previous conversation points, summarize or format that specific information into the file.\n"
+            f"Return the entire file content in the 'full_file_code' JSON field."
         )
         result = self._execute_api_with_retry(prompt, is_json=True)
         print("\n🔍 [3/3] KẾT QUẢ PHÂN TÍCH VÀ TIẾN TRÌNH XỬ LÝ:")
@@ -212,9 +231,7 @@ class GeminiLocalAgent:
                 os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(full_code)
-                print(f"\n✅ [THÀNH CÔNG] Đã ghi nội dung script mới vào file: {file_path}")
-                # print("\n--- [NỘI DUNG CODE ĐÃ TẠO] ---")
-                # print(full_code)
+                print(f"\n✅ [THÀNH CÔNG] Đã ghi nội dung vào file: {file_path}")
                 print("------------------------------")
             else:
                 print("⚠️ AI không trả về trường `full_file_code`. Kiểm tra lại lượt phản hồi.")
@@ -313,7 +330,10 @@ class GeminiLocalAgent:
 # =====================================================================
 if __name__ == "__main__":
     LIST_TOKEN = os.environ.get("LIST_TOKEN")
-    FREE_API_KEYS = LIST_TOKEN.split(",")
+    if not LIST_TOKEN:
+        print("❌ Chưa cấu hình danh sách LIST_TOKEN trong file .env!")
+        exit(1)
+    FREE_API_KEYS = [k.strip() for k in LIST_TOKEN.split(",") if k.strip()]
     agent = GeminiLocalAgent(api_keys=FREE_API_KEYS, tpm_limit=35000)
     print("\n" + "="*60)
     print("🤖 GEMINI LOCAL AGENT CLI - READY!")
@@ -329,6 +349,7 @@ if __name__ == "__main__":
                 break
             if user_input.lower() in ['clear', 'cls']:
                 os.system('cls' if os.name == 'nt' else 'clear')
+                agent.clear_session()
                 print("="*60)
                 print("🤖 GEMINI LOCAL AGENT CLI - READY!")
                 print("Gõ câu lệnh tự do. Nhập 'exit' hoặc 'quit' để thoát.")
